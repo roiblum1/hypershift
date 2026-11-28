@@ -4,9 +4,10 @@ title: Targeted Machine deletion during NodePool scale-down
 
 # Targeted Machine deletion during NodePool scale-down
 
-When you lower `spec.replicas` on a NodePool, Cluster API (CAPI) selects which Machines to delete. HyperShift does not
-set a deletion order on the MachineDeployment or MachineSet that backs a NodePool, so CAPI uses its default `Random`
-order. To choose the Machines that are removed, annotate them with `cluster.x-k8s.io/delete-machine` on the management
+When you lower `spec.replicas` on a NodePool, Cluster API (CAPI) selects which Machines to delete. Unless the
+`NodePoolScaleDown` feature gate is enabled (see [Deletion order](nodepool-lifecycle.md#deletion-order)), HyperShift
+does not set a deletion order on the MachineDeployment or MachineSet that backs a NodePool, so CAPI uses its default
+`Random` order. To choose the Machines that are removed, annotate them with `cluster.x-k8s.io/delete-machine` on the management
 cluster before you lower `spec.replicas`.
 
 This page covers removing specific Nodes while the NodePool keeps running at a lower replica count. It is not the

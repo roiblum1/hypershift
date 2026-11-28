@@ -70,6 +70,45 @@ Scaling a NodePool down will remove Nodes from the hosted cluster.
 To choose which Nodes are removed when you lower the replica count without scaling to zero, see
 [Targeted Machine deletion during NodePool scale-down](targeted-machine-deletion.md).
 
+### Deletion order
+
+!!! note
+
+    The `scaleDown` field is behind the `NodePoolScaleDown` feature gate. It is available only when the HyperShift
+    Operator is installed with `--tech-preview-no-upgrade`.
+
+By default, Cluster API deletes the Machines of a scaled-down NodePool in its `Random` order. To delete the oldest or
+the newest Machines first, set `spec.scaleDown.deletionOrder`:
+
+```yaml
+spec:
+  replicas: 3
+  management:
+    upgradeType: InPlace
+  scaleDown:
+    deletionOrder: Oldest
+```
+
+HyperShift sets this value as the deletion order of the NodePool's MachineSet (`InPlace`) or MachineDeployment
+(`Replace`). Changing it does not trigger a rollout. Cluster API applies it as follows:
+
+- Machines that are being deleted, annotated with `cluster.x-k8s.io/delete-machine`, being updated in place by
+  Cluster API, or unhealthy are deleted first, in that order. A Machine whose `NodeHealthy` condition is `Unknown`
+  counts as healthy. The deletion order only applies to the remaining healthy Machines.
+- `Newest` and `Oldest` lose precision for old Machines: healthy Machines that are both older than about 375 days get
+  the same priority and are picked by name. For long-lived Machines, choose the Machines to remove with the
+  `cluster.x-k8s.io/delete-machine` annotation instead. A fix is proposed in
+  [kubernetes-sigs/cluster-api#14583](https://github.com/kubernetes-sigs/cluster-api/pull/14583).
+- For the `Replace` upgrade type, while the MachineDeployment has more than one MachineSet, Cluster API scales down the
+  oldest MachineSet first and applies the deletion order only within it.
+- When the NodePool uses `spec.autoScaling`, the cluster autoscaler annotates the Machine that it removes, so the
+  deletion order does not decide that removal.
+
+To go back to the default order, remove the whole `scaleDown` field; an empty `scaleDown` is rejected. While the
+feature gate is enabled, HyperShift owns the deletion order and clears a value that was set directly on the MachineSet
+or MachineDeployment, so copy such a value to the NodePool before you enable the gate. If the gate is disabled later,
+the last value stays on the MachineSet or MachineDeployment.
+
 ### Scaling To Zero
 
 Node(s) can become stuck when removing all Nodes from a cluster (scaling NodePool(s) down to zero) because the Node(s) cannot be drained successfully from the cluster.
