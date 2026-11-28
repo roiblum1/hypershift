@@ -2015,6 +2015,201 @@ func TestCAPIReconcile(t *testing.T) {
 			}
 		})
 	}
+
+	// spec.scaleDown.deletionOrder is propagated to the MachineSet (InPlace) or MachineDeployment (Replace).
+	type step struct {
+		replicas      int32
+		scaleDown     hyperv1.NodePoolScaleDown
+		expectedOrder capiv1.MachineSetDeletionOrder
+	}
+	deletionOrderTests := []struct {
+		name             string
+		upgradeType      hyperv1.UpgradeType
+		scaleDownEnabled bool
+		existingOrder    capiv1.MachineSetDeletionOrder
+		steps            []step
+	}{
+		{
+			name:             "When the gate is enabled on an InPlace NodePool, it should apply deletionOrder and replicas to the MachineSet on every update",
+			upgradeType:      hyperv1.UpgradeTypeInPlace,
+			scaleDownEnabled: true,
+			steps: []step{
+				{replicas: 3, scaleDown: hyperv1.NodePoolScaleDown{DeletionOrder: hyperv1.NodePoolDeletionOrderOldest}, expectedOrder: capiv1.OldestMachineSetDeletionOrder},
+				{replicas: 2, scaleDown: hyperv1.NodePoolScaleDown{DeletionOrder: hyperv1.NodePoolDeletionOrderNewest}, expectedOrder: capiv1.NewestMachineSetDeletionOrder},
+				{replicas: 2, scaleDown: hyperv1.NodePoolScaleDown{}, expectedOrder: ""},
+			},
+		},
+		{
+			name:             "When the gate is enabled on a Replace NodePool, it should apply deletionOrder and replicas to the MachineDeployment on every update",
+			upgradeType:      hyperv1.UpgradeTypeReplace,
+			scaleDownEnabled: true,
+			steps: []step{
+				{replicas: 3, scaleDown: hyperv1.NodePoolScaleDown{DeletionOrder: hyperv1.NodePoolDeletionOrderOldest}, expectedOrder: capiv1.OldestMachineSetDeletionOrder},
+				{replicas: 2, scaleDown: hyperv1.NodePoolScaleDown{DeletionOrder: hyperv1.NodePoolDeletionOrderNewest}, expectedOrder: capiv1.NewestMachineSetDeletionOrder},
+				{replicas: 2, scaleDown: hyperv1.NodePoolScaleDown{}, expectedOrder: ""},
+			},
+		},
+		{
+			name:             "When the gate is disabled on an InPlace NodePool, it should keep the MachineSet deletion order and still apply replicas",
+			upgradeType:      hyperv1.UpgradeTypeInPlace,
+			scaleDownEnabled: false,
+			existingOrder:    capiv1.OldestMachineSetDeletionOrder,
+			steps: []step{
+				{replicas: 2, scaleDown: hyperv1.NodePoolScaleDown{DeletionOrder: hyperv1.NodePoolDeletionOrderNewest}, expectedOrder: capiv1.OldestMachineSetDeletionOrder},
+			},
+		},
+		{
+			name:             "When the gate is disabled on a Replace NodePool, it should keep the MachineDeployment deletion order and still apply replicas",
+			upgradeType:      hyperv1.UpgradeTypeReplace,
+			scaleDownEnabled: false,
+			existingOrder:    capiv1.OldestMachineSetDeletionOrder,
+			steps: []step{
+				{replicas: 2, scaleDown: hyperv1.NodePoolScaleDown{DeletionOrder: hyperv1.NodePoolDeletionOrderNewest}, expectedOrder: capiv1.OldestMachineSetDeletionOrder},
+			},
+		},
+	}
+
+	for _, tt := range deletionOrderTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			nodePool := &hyperv1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-nodepool",
+					Namespace: "test-namespace",
+				},
+				Spec: hyperv1.NodePoolSpec{
+					ClusterName: "test-cluster",
+					Management: hyperv1.NodePoolManagement{
+						UpgradeType: tt.upgradeType,
+					},
+					Platform: hyperv1.NodePoolPlatform{
+						Type: hyperv1.AWSPlatform,
+						AWS: &hyperv1.AWSNodePoolPlatform{
+							AMI: "an-ami",
+						},
+					},
+				},
+			}
+			if tt.upgradeType == hyperv1.UpgradeTypeInPlace {
+				nodePool.Spec.Management.InPlace = &hyperv1.InPlaceUpgrade{}
+			} else {
+				nodePool.Spec.Management.Replace = &hyperv1.ReplaceUpgrade{
+					Strategy: hyperv1.UpgradeStrategyRollingUpdate,
+					RollingUpdate: &hyperv1.RollingUpdate{
+						MaxUnavailable: ptr.To(intstr.FromInt(0)),
+						MaxSurge:       ptr.To(intstr.FromInt(1)),
+					},
+				}
+			}
+
+			hostedCluster := &hyperv1.HostedCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
+				Spec: hyperv1.HostedClusterSpec{
+					Platform: hyperv1.PlatformSpec{
+						Type: hyperv1.AWSPlatform,
+						AWS:  &hyperv1.AWSPlatformSpec{},
+					},
+				},
+			}
+			controlplaneNamespace := manifests.HostedControlPlaneNamespace(hostedCluster.Namespace, hostedCluster.Name)
+
+			machineTemplate := capiv1.MachineTemplateSpec{
+				Spec: capiv1.MachineSpec{
+					InfrastructureRef: capiv1.ContractVersionedObjectReference{
+						Kind:     "AWSMachineTemplate",
+						APIGroup: "infrastructure.cluster.x-k8s.io",
+						Name:     awsMachineTemplateName,
+					},
+				},
+			}
+			objects := []client.Object{
+				nodePool,
+				&capiaws.AWSMachineTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        awsMachineTemplateName,
+						Namespace:   controlplaneNamespace,
+						Annotations: map[string]string{nodePoolAnnotation: "test-namespace/test-nodepool"},
+					},
+				},
+			}
+			// The existing MachineSet or MachineDeployment carries the deletion order that was set before this reconcile,
+			// for example by a user patching it directly.
+			if tt.upgradeType == hyperv1.UpgradeTypeInPlace {
+				objects = append(objects, &capiv1.MachineSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        nodePool.GetName(),
+						Namespace:   controlplaneNamespace,
+						Annotations: map[string]string{nodePoolAnnotation: "test-namespace/test-nodepool"},
+					},
+					Spec: capiv1.MachineSetSpec{
+						Template: machineTemplate,
+						Deletion: capiv1.MachineSetDeletionSpec{Order: tt.existingOrder},
+					},
+				})
+			} else {
+				objects = append(objects, &capiv1.MachineDeployment{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      nodePool.GetName(),
+						Namespace: controlplaneNamespace,
+					},
+					Spec: capiv1.MachineDeploymentSpec{
+						Template: machineTemplate,
+						Deletion: capiv1.MachineDeploymentDeletionSpec{Order: tt.existingOrder},
+					},
+				})
+			}
+
+			c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(objects...).Build()
+			capi := &CAPI{
+				Token: &Token{
+					ConfigGenerator: &ConfigGenerator{
+						Client:                c,
+						hostedCluster:         hostedCluster,
+						nodePool:              nodePool,
+						controlplaneNamespace: controlplaneNamespace,
+						rolloutConfig: &rolloutConfig{
+							releaseImage: &releaseinfo.ReleaseImage{
+								ImageStream: &imageapi.ImageStream{
+									ObjectMeta: metav1.ObjectMeta{Name: "target-version"},
+								},
+							},
+						},
+					},
+					cpoCapabilities:        &CPOCapabilities{},
+					CreateOrUpdateProvider: upsert.New(false),
+				},
+				capiClusterName:  capiClusterName,
+				ApplyProvider:    upsert.NewApplyProvider(false),
+				scaleDownEnabled: tt.scaleDownEnabled,
+			}
+
+			key := client.ObjectKey{Namespace: controlplaneNamespace, Name: nodePool.GetName()}
+			for i, s := range tt.steps {
+				nodePool.Spec.Replicas = ptr.To(s.replicas)
+				nodePool.Spec.ScaleDown = s.scaleDown
+				g.Expect(capi.Reconcile(t.Context())).To(Succeed(), "step %d", i)
+
+				if tt.upgradeType == hyperv1.UpgradeTypeInPlace {
+					ms := &capiv1.MachineSet{}
+					g.Expect(c.Get(t.Context(), key, ms)).To(Succeed())
+					g.Expect(ms.Spec.Deletion.Order).To(Equal(s.expectedOrder), "step %d", i)
+					g.Expect(ms.Spec.Replicas).To(Equal(ptr.To(s.replicas)), "step %d", i)
+					if i == 0 {
+						// The existing MachineSet had no version, so the first reconcile propagated it and returned early.
+						// The deletion order must be applied on that path too.
+						g.Expect(ms.Spec.Template.Spec.Version).To(Equal(capi.Version()))
+					}
+				} else {
+					md := &capiv1.MachineDeployment{}
+					g.Expect(c.Get(t.Context(), key, md)).To(Succeed())
+					g.Expect(md.Spec.Deletion.Order).To(Equal(s.expectedOrder), "step %d", i)
+					g.Expect(md.Spec.Replicas).To(Equal(ptr.To(s.replicas)), "step %d", i)
+				}
+			}
+		})
+	}
 }
 
 // TestCAPIReconcile_machineset is specific for UpgradeTypeInPlace.
